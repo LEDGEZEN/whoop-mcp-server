@@ -4,19 +4,6 @@ export interface WhoopTokens {
 	expires_at: number;
 }
 
-export interface WhoopUser {
-	user_id: number;
-	email: string;
-	first_name: string;
-	last_name: string;
-}
-
-export interface WhoopBodyMeasurement {
-	height_meter: number;
-	weight_kilogram: number;
-	max_heart_rate: number;
-}
-
 export interface WhoopCycle {
 	id: number;
 	user_id: number;
@@ -99,7 +86,8 @@ export interface WhoopWorkout {
 		max_heart_rate: number;
 		kilojoule: number;
 		percent_recorded: number;
-		zone_duration: {
+		/** Named zone_durations in API v2 (zone_duration was v1); absent when there is no heart-rate data. */
+		zone_durations?: {
 			zone_zero_milli: number;
 			zone_one_milli: number;
 			zone_two_milli: number;
@@ -183,4 +171,29 @@ export interface DbWorkout {
 	zone_four_milli: number | null;
 	zone_five_milli: number | null;
 	synced_at: string;
+}
+
+export interface DbOAuthCode {
+	code_hash: string;
+	/** Shared by this code and every token issued from it. */
+	family_id: string;
+	client_id: string;
+	code_challenge: string;
+	redirect_uri: string;
+	/** Space-separated, as in the OAuth `scope` parameter. */
+	scopes: string;
+	expires_at: number;
+	consumed_at: number | null;
+}
+
+export interface DbOAuthToken {
+	token_hash: string;
+	family_id: string;
+	kind: 'access' | 'refresh';
+	client_id: string;
+	/** Space-separated, as in the OAuth `scope` parameter. */
+	scopes: string;
+	expires_at: number;
+	/** Set when a refresh token is used; a second use means it leaked. */
+	consumed_at: number | null;
 }

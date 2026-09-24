@@ -10,6 +10,8 @@ import type {
 	DbRecovery,
 	DbSleep,
 	DbWorkout,
+	DbOAuthCode,
+	DbOAuthToken,
 } from './types.js';
 
 interface TokenRow {
@@ -49,6 +51,7 @@ interface StrainTrendRow {
 
 export class WhoopDatabase {
 	private db: Database.Database;
+	private warnedUnreadableTokens = false;
 
 	constructor(dbPath = './whoop.db') {
 		this.db = new Database(dbPath);
@@ -143,6 +146,40 @@ export class WhoopDatabase {
 				synced_at TEXT DEFAULT CURRENT_TIMESTAMP
 			);
 
+			-- Sign-in for /mcp (OAuth 2.1). Codes and tokens are stored as SHA-256 hashes,
+			-- so a copy of this file cannot be used to call the server.
+			CREATE TABLE IF NOT EXISTS oauth_clients (
+				client_id TEXT PRIMARY KEY,
+				client_info TEXT NOT NULL,
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP
+			);
+
+			-- family_id ties a code to every token issued from it, so a replayed code or
+			-- refresh token revokes the whole sign-in. Used rows are kept (consumed_at) while
+			-- their family is still live, which is what makes a replay detectable.
+			CREATE TABLE IF NOT EXISTS oauth_codes (
+				code_hash TEXT PRIMARY KEY,
+				family_id TEXT NOT NULL,
+				client_id TEXT NOT NULL,
+				code_challenge TEXT NOT NULL,
+				redirect_uri TEXT NOT NULL,
+				scopes TEXT NOT NULL,
+				expires_at INTEGER NOT NULL,
+				consumed_at INTEGER
+			);
+
+			CREATE TABLE IF NOT EXISTS oauth_tokens (
+				token_hash TEXT PRIMARY KEY,
+				family_id TEXT NOT NULL,
+				kind TEXT NOT NULL CHECK (kind IN ('access', 'refresh')),
+				client_id TEXT NOT NULL,
+				scopes TEXT NOT NULL,
+				expires_at INTEGER NOT NULL,
+				consumed_at INTEGER
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_oauth_tokens_family ON oauth_tokens(family_id);
+
 			CREATE INDEX IF NOT EXISTS idx_cycles_start ON cycles(start_time);
 			CREATE INDEX IF NOT EXISTS idx_recovery_created ON recovery(created_at);
 			CREATE INDEX IF NOT EXISTS idx_sleep_start ON sleep(start_time);
@@ -166,13 +203,21 @@ export class WhoopDatabase {
 		const row = this.db.prepare('SELECT * FROM tokens WHERE id = 1').get() as TokenRow | undefined;
 		if (!row) return null;
 
-		const accessToken = isEncrypted(row.access_token)
-			? decrypt(row.access_token)
-			: row.access_token;
-
-		const refreshToken = isEncrypted(row.refresh_token)
-			? decrypt(row.refresh_token)
-			: row.refresh_token;
+		let accessToken: string;
+		let refreshToken: string;
+		try {
+			accessToken = isEncrypted(row.access_token) ? decrypt(row.access_token) : row.access_token;
+			refreshToken = isEncrypted(row.refresh_token) ? decrypt(row.refresh_token) : row.refresh_token;
+		} catch {
+			// The key changed (ENCRYPTION_SECRET, or WHOOP_CLIENT_SECRET when that is unset).
+			// Treat WHOOP as disconnected so the server still starts and get_auth_url can
+			// store fresh tokens, instead of crashing on every restart.
+			if (!this.warnedUnreadableTokens) {
+				this.warnedUnreadableTokens = true;
+				process.stderr.write('Stored Whoop tokens could not be decrypted (encryption key changed?). Run get_auth_url to reconnect.\n');
+			}
+			return null;
+		}
 
 		return {
 			access_token: accessToken,
@@ -276,18 +321,18 @@ export class WhoopDatabase {
 					s.end,
 					s.nap ? 1 : 0,
 					s.score_state,
-					s.score?.stage_summary.total_in_bed_time_milli ?? null,
-					s.score?.stage_summary.total_awake_time_milli ?? null,
-					s.score?.stage_summary.total_light_sleep_time_milli ?? null,
-					s.score?.stage_summary.total_slow_wave_sleep_time_milli ?? null,
-					s.score?.stage_summary.total_rem_sleep_time_milli ?? null,
+					s.score?.stage_summary?.total_in_bed_time_milli ?? null,
+					s.score?.stage_summary?.total_awake_time_milli ?? null,
+					s.score?.stage_summary?.total_light_sleep_time_milli ?? null,
+					s.score?.stage_summary?.total_slow_wave_sleep_time_milli ?? null,
+					s.score?.stage_summary?.total_rem_sleep_time_milli ?? null,
 					s.score?.sleep_performance_percentage ?? null,
 					s.score?.sleep_efficiency_percentage ?? null,
 					s.score?.sleep_consistency_percentage ?? null,
 					s.score?.respiratory_rate ?? null,
-					s.score?.sleep_needed.baseline_milli ?? null,
-					s.score?.sleep_needed.need_from_sleep_debt_milli ?? null,
-					s.score?.sleep_needed.need_from_recent_strain_milli ?? null
+					s.score?.sleep_needed?.baseline_milli ?? null,
+					s.score?.sleep_needed?.need_from_sleep_debt_milli ?? null,
+					s.score?.sleep_needed?.need_from_recent_strain_milli ?? null
 				);
 			}
 		});
@@ -318,12 +363,12 @@ export class WhoopDatabase {
 					w.score?.average_heart_rate ?? null,
 					w.score?.max_heart_rate ?? null,
 					w.score?.kilojoule ?? null,
-					w.score?.zone_duration.zone_zero_milli ?? null,
-					w.score?.zone_duration.zone_one_milli ?? null,
-					w.score?.zone_duration.zone_two_milli ?? null,
-					w.score?.zone_duration.zone_three_milli ?? null,
-					w.score?.zone_duration.zone_four_milli ?? null,
-					w.score?.zone_duration.zone_five_milli ?? null
+					w.score?.zone_durations?.zone_zero_milli ?? null,
+					w.score?.zone_durations?.zone_one_milli ?? null,
+					w.score?.zone_durations?.zone_two_milli ?? null,
+					w.score?.zone_durations?.zone_three_milli ?? null,
+					w.score?.zone_durations?.zone_four_milli ?? null,
+					w.score?.zone_durations?.zone_five_milli ?? null
 				);
 			}
 		});
@@ -341,25 +386,6 @@ export class WhoopDatabase {
 
 	getLatestSleep(): DbSleep | null {
 		return this.db.prepare('SELECT * FROM sleep WHERE is_nap = 0 ORDER BY start_time DESC LIMIT 1').get() as DbSleep | undefined ?? null;
-	}
-
-	getCyclesByDateRange(startDate: string, endDate: string): DbCycle[] {
-		return this.db.prepare(`
-			SELECT * FROM cycles WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC
-		`).all(startDate, endDate) as DbCycle[];
-	}
-
-	getRecoveriesByDateRange(startDate: string, endDate: string): DbRecovery[] {
-		return this.db.prepare(`
-			SELECT * FROM recovery WHERE created_at >= ? AND created_at <= ? ORDER BY created_at DESC
-		`).all(startDate, endDate) as DbRecovery[];
-	}
-
-	getSleepsByDateRange(startDate: string, endDate: string, includeNaps = false): DbSleep[] {
-		const query = includeNaps
-			? 'SELECT * FROM sleep WHERE start_time >= ? AND start_time <= ? ORDER BY start_time DESC'
-			: 'SELECT * FROM sleep WHERE start_time >= ? AND start_time <= ? AND is_nap = 0 ORDER BY start_time DESC';
-		return this.db.prepare(query).all(startDate, endDate) as DbSleep[];
 	}
 
 	getWorkoutsByDateRange(startDate: string, endDate: string): DbWorkout[] {
@@ -395,6 +421,78 @@ export class WhoopDatabase {
 			WHERE strain IS NOT NULL AND start_time >= DATE('now', '-' || ? || ' days')
 			ORDER BY start_time DESC
 		`).all(days) as StrainTrendRow[];
+	}
+
+	getOAuthClient(clientId: string): string | undefined {
+		const row = this.db.prepare('SELECT client_info FROM oauth_clients WHERE client_id = ?').get(clientId) as { client_info: string } | undefined;
+		return row?.client_info;
+	}
+
+	saveOAuthClient(clientId: string, clientInfo: string): void {
+		this.db.prepare('INSERT INTO oauth_clients (client_id, client_info) VALUES (?, ?)').run(clientId, clientInfo);
+	}
+
+	saveOAuthCode(code: Omit<DbOAuthCode, 'consumed_at'>): void {
+		this.db.prepare(`
+			INSERT INTO oauth_codes (code_hash, family_id, client_id, code_challenge, redirect_uri, scopes, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`).run(code.code_hash, code.family_id, code.client_id, code.code_challenge, code.redirect_uri, code.scopes, code.expires_at);
+	}
+
+	getOAuthCode(codeHash: string): DbOAuthCode | undefined {
+		return this.db.prepare('SELECT * FROM oauth_codes WHERE code_hash = ?').get(codeHash) as DbOAuthCode | undefined;
+	}
+
+	/** Marks the code used and returns it, in one statement, so it can be exchanged only once. */
+	consumeOAuthCode(codeHash: string, now: number): DbOAuthCode | undefined {
+		return this.db.prepare(
+			'UPDATE oauth_codes SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL RETURNING *'
+		).get(now, codeHash) as DbOAuthCode | undefined;
+	}
+
+	saveOAuthToken(token: Omit<DbOAuthToken, 'consumed_at'>): void {
+		this.db.prepare(`
+			INSERT INTO oauth_tokens (token_hash, family_id, kind, client_id, scopes, expires_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`).run(token.token_hash, token.family_id, token.kind, token.client_id, token.scopes, token.expires_at);
+	}
+
+	getOAuthToken(tokenHash: string, kind?: DbOAuthToken['kind']): DbOAuthToken | undefined {
+		const row = this.db.prepare('SELECT * FROM oauth_tokens WHERE token_hash = ?').get(tokenHash) as DbOAuthToken | undefined;
+		return kind === undefined || row?.kind === kind ? row : undefined;
+	}
+
+	/** Marks the refresh token used and returns it, in one statement, so it works only once. */
+	consumeRefreshToken(tokenHash: string, clientId: string, now: number): DbOAuthToken | undefined {
+		return this.db.prepare(`
+			UPDATE oauth_tokens SET consumed_at = ?
+			WHERE token_hash = ? AND kind = 'refresh' AND client_id = ? AND consumed_at IS NULL
+			RETURNING *
+		`).get(now, tokenHash, clientId) as DbOAuthToken | undefined;
+	}
+
+	deleteOAuthToken(tokenHash: string): void {
+		this.db.prepare('DELETE FROM oauth_tokens WHERE token_hash = ?').run(tokenHash);
+	}
+
+	/** Revokes every token issued from one sign-in. */
+	deleteOAuthFamily(familyId: string): void {
+		this.db.prepare('DELETE FROM oauth_tokens WHERE family_id = ?').run(familyId);
+	}
+
+	/**
+	 * Deletes expired codes and tokens. A used code or refresh token is kept while its
+	 * family still has a live token: it is the marker that catches a late replay, so it
+	 * must outlive its own expiry for as long as a thief could be using the family.
+	 */
+	deleteExpiredOAuth(now: number): void {
+		const liveFamilies = 'SELECT family_id FROM oauth_tokens WHERE consumed_at IS NULL AND expires_at >= ?';
+		this.db.prepare(
+			`DELETE FROM oauth_codes WHERE expires_at < ? AND (consumed_at IS NULL OR family_id NOT IN (${liveFamilies}))`
+		).run(now, now);
+		this.db.prepare(
+			`DELETE FROM oauth_tokens WHERE expires_at < ? AND (consumed_at IS NULL OR family_id NOT IN (${liveFamilies}))`
+		).run(now, now);
 	}
 
 	close(): void {
